@@ -1,0 +1,9 @@
+[package]
+name = "bluz"
+version = "0.1.0"
+edition = "2024"
+description = "A small Rust command-line application."
+repository = "https://github.com/jihaohaaaa/bluz"
+readme = "README.md"
+
+[dependencies]
