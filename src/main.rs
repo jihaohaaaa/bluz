@@ -48,7 +48,6 @@ struct Headphone {
     card_name: Option<String>,
     active_profile: Option<String>,
     codec_options: Vec<CodecOption>,
-    path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -84,13 +83,23 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        let selected_address = self
+            .devices
+            .get(self.selected)
+            .map(|device| device.address.clone());
+
         match connected_headphones() {
             Ok(devices) => {
                 let count = devices.len();
                 self.devices = devices;
-                self.selected = self.selected.min(self.devices.len().saturating_sub(1));
-                self.status =
-                    format!("Connected bluetooth headphones: {count} | ↑/↓ select | ←/→ codec");
+                self.selected = selected_address
+                    .and_then(|address| {
+                        self.devices
+                            .iter()
+                            .position(|device| device.address == address)
+                    })
+                    .unwrap_or(self.selected.min(self.devices.len().saturating_sub(1)));
+                self.status = self.selection_status(count);
             }
             Err(err) => {
                 self.devices.clear();
@@ -104,12 +113,25 @@ impl App {
 
     fn select_next(&mut self) {
         if !self.devices.is_empty() {
-            self.selected = (self.selected + 1).min(self.devices.len() - 1);
+            self.selected = (self.selected + 1) % self.devices.len();
+            self.status = self.selection_status(self.devices.len());
         }
     }
 
     fn select_previous(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if !self.devices.is_empty() {
+            self.selected = (self.selected + self.devices.len() - 1) % self.devices.len();
+            self.status = self.selection_status(self.devices.len());
+        }
+    }
+
+    fn selection_status(&self, count: usize) -> String {
+        let selected = self
+            .devices
+            .get(self.selected)
+            .map(|device| format!("selected: {} ({})", device.name, device.address))
+            .unwrap_or_else(|| "selected: none".to_string());
+        format!("{count} connected | {selected} | ↑/↓ select | ←/→ codec | 1-9 choose")
     }
 
     fn switch_selected_codec(&mut self, delta: isize) {
@@ -150,11 +172,28 @@ impl App {
             return;
         };
 
+        let released_ldac = if option.profile == "a2dp-sink" {
+            match self.release_other_ldac_devices(&selected_address) {
+                Ok(count) => count,
+                Err(err) => {
+                    self.status = format!("Failed to release LDAC on another device: {err}");
+                    return;
+                }
+            }
+        } else {
+            0
+        };
+
         match set_card_profile(&card_name, &option.profile) {
             Ok(()) => {
                 thread::sleep(Duration::from_secs(2));
-                if !self.refresh_after_switch(&selected_address, &selected_name, &option, false)
-                    && option.profile == "a2dp-sink"
+                if !self.refresh_after_switch(
+                    &selected_address,
+                    &selected_name,
+                    &option,
+                    false,
+                    released_ldac,
+                ) && option.profile == "a2dp-sink"
                 {
                     match reconnect_bluetooth_device(&selected_address) {
                         Ok(()) => {
@@ -164,6 +203,7 @@ impl App {
                                 &selected_name,
                                 &option,
                                 true,
+                                released_ldac,
                             );
                         }
                         Err(err) => {
@@ -180,12 +220,52 @@ impl App {
         }
     }
 
+    fn release_other_ldac_devices(&self, selected_address: &str) -> Result<usize, Box<dyn Error>> {
+        let mut released = 0;
+        for device in &self.devices {
+            if device.address == selected_address
+                || device.active_profile.as_deref() != Some("a2dp-sink")
+            {
+                continue;
+            }
+
+            let Some(card_name) = device.card_name.as_deref() else {
+                continue;
+            };
+            let Some(fallback) = device
+                .codec_options
+                .iter()
+                .find(|option| {
+                    option.profile != "a2dp-sink" && option.profile.starts_with("a2dp-sink")
+                })
+                .or_else(|| {
+                    device
+                        .codec_options
+                        .iter()
+                        .find(|option| option.profile != "a2dp-sink")
+                })
+            else {
+                continue;
+            };
+
+            set_card_profile(card_name, &fallback.profile)?;
+            released += 1;
+        }
+
+        if released > 0 {
+            thread::sleep(Duration::from_secs(2));
+        }
+
+        Ok(released)
+    }
+
     fn refresh_after_switch(
         &mut self,
         selected_address: &str,
         selected_name: &str,
         option: &CodecOption,
         used_reconnect: bool,
+        released_ldac: usize,
     ) -> bool {
         match connected_headphones() {
             Ok(devices) => {
@@ -206,7 +286,15 @@ impl App {
                     } else {
                         ""
                     };
-                    self.status = format!("Switched {selected_name} to {}{suffix}", option.label);
+                    let release_note = if released_ldac > 0 {
+                        format!("; released LDAC on {released_ldac} other device(s)")
+                    } else {
+                        String::new()
+                    };
+                    self.status = format!(
+                        "Switched {selected_name} to {}{suffix}{release_note}",
+                        option.label
+                    );
                     true
                 } else {
                     self.status =
@@ -310,38 +398,52 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             device
                 .codec_options
                 .iter()
-                .map(|option| {
-                    if device.active_profile.as_deref() == Some(option.profile.as_str()) {
-                        format!("*{}", option.label)
-                    } else {
-                        option.label.clone()
-                    }
+                .enumerate()
+                .map(|(index, option)| {
+                    let marker =
+                        if device.active_profile.as_deref() == Some(option.profile.as_str()) {
+                            "*"
+                        } else {
+                            ""
+                        };
+                    format!("{}:{marker}{}", index + 1, option.label)
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
 
+        let selected = if app
+            .devices
+            .get(app.selected)
+            .map(|selected| selected.address.as_str())
+            == Some(device.address.as_str())
+        {
+            ">"
+        } else {
+            ""
+        };
+
         Row::new([
+            Cell::from(selected),
             Cell::from(device.name.clone()),
             Cell::from(device.address.clone()),
             Cell::from(device.codec.clone()),
             Cell::from(codec_choices),
-            Cell::from(device.path.clone()),
         ])
     });
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(22),
+            Constraint::Length(1),
+            Constraint::Percentage(26),
             Constraint::Length(17),
             Constraint::Length(10),
-            Constraint::Percentage(33),
-            Constraint::Percentage(18),
+            Constraint::Percentage(46),
         ],
     )
     .header(
-        Row::new(["Name", "Address", "Codec", "Available codecs", "BlueZ path"]).style(
+        Row::new(["", "Name", "Address", "Codec", "Available codecs"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -396,7 +498,7 @@ fn connected_headphones() -> Result<Vec<Headphone>, Box<dyn Error>> {
     let mut devices = manager
         .get_managed_objects()?
         .into_iter()
-        .filter_map(|(path, interfaces)| {
+        .filter_map(|(_path, interfaces)| {
             let properties = interfaces.get(DEVICE_INTERFACE)?;
             let connected = prop_bool(properties.get("Connected")).unwrap_or(false);
             if !connected {
@@ -426,7 +528,6 @@ fn connected_headphones() -> Result<Vec<Headphone>, Box<dyn Error>> {
                 card_name: (!audio_card.card_name.is_empty()).then_some(audio_card.card_name),
                 active_profile: audio_card.active_profile,
                 codec_options: audio_card.codec_options,
-                path: path.to_string(),
             })
         })
         .collect::<Vec<_>>();
